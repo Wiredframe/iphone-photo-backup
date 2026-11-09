@@ -1,6 +1,6 @@
-# iphone-fotos-sichern
+# iphone-photo-backup
 
-Back up the photos and videos you took with your iPhone camera to any machine you can reach via SSH (a NAS, a home server, a Linux box). Over USB or Wi-Fi, without iCloud, without Photos.app, without an import dialog. The name is German for "back up iPhone photos", and so is the command line output.
+Back up the photos and videos you took with your iPhone camera to any machine you can reach via SSH (a NAS, a home server, a Linux box). Over USB or Wi-Fi, without iCloud, without Photos.app, without an import dialog.
 
 ## What it backs up
 
@@ -10,7 +10,7 @@ Only what the camera shot, front and back. The script reads the iPhone's own Pho
 - images from AirDrop, WhatsApp, Safari and other apps
 - shared albums
 - recently deleted photos
-- optionally hidden photos (`--ohne-ausgeblendete`)
+- optionally hidden photos (`--skip-hidden`)
 
 Live Photos come with their video. Originals are copied (HEIC, JPEG, DNG, MOV, ...), edits made in Photos.app are not.
 
@@ -30,7 +30,7 @@ The date is the capture date in the time zone the photo was taken in. Files keep
 
 - Nothing is ever deleted or overwritten, neither on the iPhone nor on the target (`rsync --ignore-existing`).
 - After every batch, the size of each uploaded file is checked on the target. Only then is the batch recorded as done.
-- `~/.local/state/iphone-fotos-sichern/gesichert.tsv` remembers what has been backed up (asset UUID and file names), so every run only fetches new assets. Delete it to start over, existing files on the target are recognized and skipped.
+- `~/.local/state/iphone-photo-backup/backed-up.tsv` remembers what has been backed up (asset UUID and file names), so every run only fetches new assets. Delete it to start over, existing files on the target are recognized and skipped.
 - A lost connection (iPhone locked, cable pulled, Wi-Fi gone) ends the run cleanly, the next run picks up where it stopped.
 - Fetching and uploading run concurrently in batches of 100 files or 2 GB.
 
@@ -46,22 +46,22 @@ The date is the capture date in the time zone the photo was taken in. Files keep
 ## Install
 
 ```sh
-git clone https://github.com/Wiredframe/iphone-fotos-sichern.git
-ln -s "$PWD/iphone-fotos-sichern/iphone-fotos-sichern" ~/.local/bin/
-mkdir -p ~/.config/iphone-fotos-sichern
-cp iphone-fotos-sichern/config.example.toml ~/.config/iphone-fotos-sichern/config.toml
+git clone https://github.com/Wiredframe/iphone-photo-backup.git
+ln -s "$PWD/iphone-photo-backup/iphone-photo-backup" ~/.local/bin/
+mkdir -p ~/.config/iphone-photo-backup
+cp iphone-photo-backup/config.example.toml ~/.config/iphone-photo-backup/config.toml
 ```
 
-Edit `config.toml`: `host` is anything `ssh` accepts (an alias from `~/.ssh/config`, `user@host`), `ziel` the target folder, created if missing. Both can also be given as options.
+Edit `config.toml`: `host` is anything `ssh` accepts (an alias from `~/.ssh/config`, `user@host`), `dest` the target folder, created if missing. Both can also be given as options.
 
 ## Usage
 
 ```sh
-iphone-fotos-sichern --probe          # count only: on the iPhone, already backed up, new
-iphone-fotos-sichern                  # back up everything new
-iphone-fotos-sichern --limit 50       # at most 50 assets in this run
-iphone-fotos-sichern --host nas --ziel /srv/photos/iphone
-iphone-fotos-sichern --udid <udid>    # pick one iPhone if several are connected
+iphone-photo-backup --probe          # count only: on the iPhone, already backed up, new
+iphone-photo-backup                  # back up everything new
+iphone-photo-backup --limit 50       # at most 50 assets in this run
+iphone-photo-backup --host nas --dest /srv/photos/iphone
+iphone-photo-backup --udid <udid>    # pick one iPhone if several are connected
 ```
 
 USB is preferred over Wi-Fi when both are available.

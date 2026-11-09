@@ -20,17 +20,18 @@ import argparse
 import asyncio
 import fcntl
 import os
+import re
 import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from pymobiledevice3.exceptions import AfcException, ConnectionFailedError, ConnectionTerminatedError
+from pymobiledevice3.exceptions import (AfcException, ConnectionFailedError, ConnectionTerminatedError,
+                                        NotPairedError, PairingError)
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.services.afc import AfcService
 from pymobiledevice3.usbmux import select_device
@@ -42,7 +43,6 @@ LIVE_PHOTO = 2  # ZKINDSUBTYPE of a photo with video
 
 CONFIG = Path.home() / ".config/iphone-photo-backup/config.toml"
 STATE = Path.home() / ".local/state/iphone-photo-backup"
-MANIFEST = STATE / "backed-up.tsv"
 LOCK = STATE / "run.lock"
 STAGING = Path.home() / "Library/Caches/iphone-photo-backup"
 PENDING = STAGING / ".partial"  # files of one asset until all of them have arrived
@@ -55,15 +55,46 @@ class Disconnected(Exception):
     """Lost the connection to the iPhone: upload what is complete, then stop."""
 
 
+SAFE_PATH = re.compile(r"[\w./+-]+")  # needs no quoting in a remote shell
+
+
+def parse_config(text):
+    """host and dest from the config file. Plain `key = "value"` lines are enough,
+    so this also works on Python < 3.11 without tomllib."""
+    try:
+        import tomllib
+    except ImportError:
+        data = {}
+        for n, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.fullmatch(r'(\w+)\s*=\s*"([^"]*)"\s*(#.*)?', line)
+            if not m:
+                raise ValueError(f"line {n}: expected key = \"value\"") from None
+            data[m[1]] = m[2]
+    else:
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(str(e)) from e
+    return {k: str(data[k]) for k in ("host", "dest") if k in data}
+
+
 def config():
     """Defaults for --host and --dest from the config file, if there is one."""
     if not CONFIG.exists():
         return {}
     try:
-        data = tomllib.loads(CONFIG.read_text())
-    except tomllib.TOMLDecodeError as e:
-        sys.exit(f"{CONFIG} is not valid TOML: {e}")
-    return {k: str(data[k]) for k in ("host", "dest") if k in data}
+        return parse_config(CONFIG.read_text())
+    except ValueError as e:
+        sys.exit(f"{CONFIG} is not valid: {e}")
+
+
+def manifest_path(host, dest):
+    """One list per target, so a second target gets its own full backup."""
+    slug = re.sub(r"[^\w.@+-]+", "_", f"{host}_{dest.rstrip('/')}").strip("_")
+    return STATE / f"backed-up_{slug}.tsv"
 
 
 def args():
@@ -77,12 +108,40 @@ def args():
     p.add_argument("--dest", default=defaults.get("dest"), help="folder on the target")
     p.add_argument("--udid", help="a specific iPhone (default: the first one, USB before Wi-Fi)")
     p.add_argument("--probe", action="store_true", help="only count, transfer nothing")
-    p.add_argument("--limit", type=int, help="back up at most this many assets")
+    p.add_argument("--limit", type=positive, help="back up at most this many assets")
     p.add_argument("--skip-hidden", action="store_true", help="leave out hidden photos")
     a = p.parse_args()
-    if not a.probe and not (a.host and a.dest):
+    if not (a.host and a.dest):
         p.error(f"--host and --dest are missing (as options or in {CONFIG})")
+    a.dest = home_relative(a.dest)
+    if a.dest.startswith("~"):
+        p.error("--dest: use an absolute path or one relative to the home folder (~/…)")
     return a
+
+
+def home_relative(dest):
+    """~/x becomes x: ssh and rsync both start in the home folder, and a quoted ~ wouldn't expand."""
+    if dest == "~":
+        return "."
+    return dest[2:] or "." if dest.startswith("~/") else dest
+
+
+def positive(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
+def rsync_args(dest):
+    """Flags for rsync. macOS ships openrsync, which has no -s (--protect-args)."""
+    if SAFE_PATH.fullmatch(dest):
+        return []
+    version = subprocess.run(["rsync", "--version"], capture_output=True, text=True).stdout
+    if "openrsync" in version:
+        sys.exit(f"The target folder {dest!r} contains spaces or special characters, which the rsync "
+                 "that ships with macOS can't handle. Install rsync (brew install rsync) or pick another folder.")
+    return ["-s"]
 
 
 def lock():
@@ -95,11 +154,11 @@ def lock():
     return f
 
 
-def load_manifest():
+def load_manifest(manifest):
     """uuid -> paths and path -> uuid from the list of backed-up assets."""
     done, owner = set(), {}
-    if MANIFEST.exists():
-        for line in MANIFEST.read_text().splitlines():
+    if manifest.exists():
+        for line in manifest.read_text().splitlines():
             uuid, sep, paths = line.partition("\t")
             if not sep or not paths:
                 continue  # truncated line, the asset gets checked again
@@ -109,8 +168,8 @@ def load_manifest():
     return done, owner
 
 
-def append_manifest(rows):
-    with MANIFEST.open("a") as f:
+def append_manifest(manifest, rows):
+    with manifest.open("a") as f:
         for uuid, paths in rows:
             f.write(f"{uuid}\t{'|'.join(paths)}\n")
         f.flush()
@@ -128,21 +187,30 @@ def ssh(host, command):
     return subprocess.run(["ssh", host, command], check=True, capture_output=True, text=True).stdout
 
 
-def remote_files(host, dest):
-    """Name -> size of every file in the target folder."""
-    out = ssh(host, f"find {shlex.quote(dest)} -maxdepth 1 -type f -printf '%f\\t%s\\n'")
+def parse_ls(out):
+    """Name -> size of the regular files in `ls -ln` output (POSIX, so GNU, BSD and BusyBox alike)."""
     files = {}
     for line in out.splitlines():
-        name, _, size = line.rpartition("\t")
-        files[name] = int(size)
+        parts = line.split(None, 8)  # mode links uid gid size month day time name
+        if len(parts) == 9 and line.startswith("-"):
+            files[parts[8]] = int(parts[4])
     return files
+
+
+def remote_files(host, dest):
+    """Name -> size of every file in the target folder."""
+    return parse_ls(ssh(host, f"cd {shlex.quote(dest)} && LC_ALL=C ls -lnA"))
 
 
 async def connect(udid):
     device = await select_device(udid=udid)
     if device is None:
         sys.exit("No iPhone found. Connect it by cable or enable \"Show this iPhone when on Wi-Fi\" in the Finder, then unlock it.")
-    lockdown = await create_using_usbmux(serial=device.serial, connection_type=device.connection_type)
+    try:
+        lockdown = await create_using_usbmux(serial=device.serial, connection_type=device.connection_type)
+    except (PairingError, NotPairedError):
+        sys.exit("The iPhone doesn't trust this Mac yet, or it is locked. Unlock it, connect it by cable "
+                 "once and tap \"Trust\".")
     afc = AfcService(lockdown)
     await afc.connect()
     print(f"Connected to {lockdown.short_info.get('DeviceName', device.serial)} ({'USB' if device.is_usb else 'Wi-Fi'})")
@@ -206,9 +274,9 @@ def choose_name(day, filename, size, uuid, owner, remote):
     return None, False
 
 
-def upload(host, dest, source, expected):
+def upload(host, dest, source, expected, flags):
     """Uploads a batch, then checks the size of every file on the target."""
-    subprocess.run(["rsync", "-rt", "-s", "--ignore-existing",
+    subprocess.run(["rsync", "-rt", *flags, "--ignore-existing",
                     f"{source}/", f"{host}:{dest}/"], check=True)
     remote = remote_files(host, dest)
     wrong = [name for name, size in expected.items() if remote.get(name) != size]
@@ -217,24 +285,26 @@ def upload(host, dest, source, expected):
                  f"{' …' if len(wrong) > 5 else ''}. None of them recorded as backed up.")
 
 
-def finish_batch(host, dest, source, rows, expected):
+def finish_batch(host, dest, source, rows, expected, flags, manifest):
     """Runs in the background: upload the batch, verify, record, clean up."""
     if expected:
-        upload(host, dest, source, expected)
-    append_manifest(rows)
+        upload(host, dest, source, expected, flags)
+    append_manifest(manifest, rows)
     shutil.rmtree(source, ignore_errors=True)
     return len(rows), expected
 
 
 async def main():
     a = args()
+    flags = rsync_args(a.dest)
+    manifest = manifest_path(a.host, a.dest)
     _lock = lock()
     try:
         afc = await connect(a.udid)
     except (ConnectionFailedError, ConnectionTerminatedError):
         sys.exit("No connection to the iPhone. Unlock it and connect it by cable or to the same Wi-Fi.")
     assets = await camera_assets(afc, a.skip_hidden)
-    done, owner = load_manifest()
+    done, owner = load_manifest(manifest)
     todo = [r for r in assets if r[0] not in done]
     print(f"{len(assets)} camera assets on the iPhone, {len(assets) - len(todo)} already backed up, {len(todo)} new.")
     if a.probe or not todo:
@@ -269,7 +339,8 @@ async def main():
         if not batch:
             return
         await wait_upload()  # at most one upload at a time
-        uploading = asyncio.create_task(asyncio.to_thread(finish_batch, a.host, a.dest, current, batch, expected))
+        uploading = asyncio.create_task(asyncio.to_thread(finish_batch, a.host, a.dest, current, batch, expected,
+                                                         flags, manifest))
         batch_no += 1
         current = STAGING / f"batch-{batch_no}"
         current.mkdir()

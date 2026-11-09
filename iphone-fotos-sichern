@@ -1,0 +1,12 @@
+#!/bin/bash
+# Sichert selbst aufgenommene Fotos und Videos vom iPhone (USB oder WLAN) per SSH auf einen anderen Rechner.
+# Runs the Python script with the interpreter of the pipx venv of pymobiledevice3.
+set -euo pipefail
+here="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+py="${PIPX_HOME:-$HOME/Library/Application Support/pipx}/venvs/pymobiledevice3/bin/python"
+[[ -x "$py" ]] || py="$HOME/.local/pipx/venvs/pymobiledevice3/bin/python"
+if [[ ! -x "$py" ]]; then
+  echo "pymobiledevice3 fehlt: pipx install pymobiledevice3" >&2
+  exit 1
+fi
+exec "$py" -I "$here/iphone_fotos_sichern.py" "$@"

@@ -1,0 +1,3 @@
+# Copy to ~/.config/iphone-fotos-sichern/config.toml
+host = "nas"                 # anything ssh accepts: alias from ~/.ssh/config, user@host, ...
+ziel = "/srv/photos/iphone"  # folder on the host, created if missing
